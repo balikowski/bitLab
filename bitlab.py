@@ -45,6 +45,37 @@ def build_version_payload(peer_ip: str, peer_port: int) -> bytes:
         nonce, ua_len, ua, start_height, relay
     ])
 
+def parse_addr_payload(payload: bytes):
+    """
+    Dekoduje payload wiadomości 'addr',
+    wyciągając listę znanych peerów (IP, port, timestamp, services) przesłaną przez zdalny węzeł.
+    """
+
+    peers = []
+    if not payload:
+        print("[i] addr: pusty payload – peer nie podał adresów.")
+        return peers
+
+    count, offset = compact_size_decode(payload, 0)
+    for _ in range(count):
+        if offset + 30 > len(payload):
+            break
+        timestamp, services = struct.unpack("<IQ", payload[offset:offset+12])
+        offset += 12
+        ip_raw = payload[offset:offset+16]
+        offset += 16
+        port, = struct.unpack(">H", payload[offset:offset+2])
+        offset += 2
+
+        if ip_raw[:12] == b"\x00" * 10 + b"\xff\xff":
+            ipv4_bytes = ip_raw[12:]
+            ip_str = ".".join(str(b) for b in ipv4_bytes)
+        else:
+            ip_str = ":".join(f"{ip_raw[i:i+2].hex()}" for i in range(0, 16, 2))
+
+        peers.append((ip_str, port, timestamp, services))
+    return peers
+
 
 class BitcoinPeer:
     """Reprezentuje połączenie z jednym peerem Bitcoina."""
@@ -67,6 +98,87 @@ class BitcoinPeer:
         msg = build_message(command, payload)
         self.sock.sendall(msg)
         print(f"[<] Wysłano '{command}' ({len(payload)} B).")
+
+    def send_getaddr(self):
+        """
+        Wysyła do peera wiadomość 'getaddr',
+        a następnie czeka na odpowiedź typu 'addr' i zapisuje z niej otrzymaną listę adresów sieci Bitcoin.
+        """
+        self._ensure_connected()
+        self._send_msg("getaddr", build_getaddr_payload())
+        print("[+] Czekam na 'addr'...")
+        try:
+            _, pl = self._poll_until({"addr"}, timeout=30.0)
+        except TimeoutError as e:
+            print(f"[-] Timeout: {e}")
+            return
+        self.last_addr_peers = parse_addr_payload(pl)
+        for i, (ip, port, ts, services) in enumerate(self.last_addr_peers[:50], start=1):
+            tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
+            print(f"  {i:3d}. {ip}:{port} (czas: {tstr}, services: {services})")
+
+    def list_last_addr_peers(self):
+        """
+        Wypisuje listę peerów odebranych wcześniej w wiadomości 'addr',
+        jeśli taka została zapamiętana po wywołaniu getaddr.
+        """
+        if not self.last_addr_peers:
+            print("[-] Brak zapisanych peerów – użyj getaddr.")
+            return
+        print(f"[+] Peery z ostatniego 'addr' ({len(self.last_addr_peers)}):")
+        for i, (ip, port, ts, services) in enumerate(self.last_addr_peers, start=1):
+            tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))
+            print(f"  {i:3d}. {ip}:{port}  (czas: {tstr}, services: {services})")
+
+    def connect_via_seeds(self, timeout: float = 5.0):
+        """
+        Próbuje kolejno połączyć się z peerami uzyskanymi z publicznych DNS seedów Bitcoina,
+        losując adresy i wykonując handshake po pomyślnym zestawieniu połączenia.
+        """
+        last_error = None
+        for host in DNS_SEEDS:
+            print(f"[+] Próba seeda: {host}")
+            try:
+                infos = socket.getaddrinfo(host, 8333, socket.AF_INET, socket.SOCK_STREAM)
+            except socket.gaierror as e:
+                print(f"    [!] DNS error: {e}")
+                last_error = e
+                continue
+            random.shuffle(infos)
+            for family, socktype, proto, canonname, sockaddr in infos:
+                ip, port = sockaddr
+                print(f"    [+] Próba połączenia z {ip}:{port} ...")
+                s = socket.socket(family, socktype, proto)
+                s.settimeout(timeout)
+                try:
+                    s.connect((ip, port))
+                    s.setblocking(False)
+                    print(f"    [✓] Udało się połączyć z {ip}:{port}")
+                    self.sock = s
+                    self.reader = NonBlockingReader(s)
+                    self.ip = ip
+                    self.port = port
+                    self.handshake()
+                    return
+                except (socket.timeout, OSError) as e:
+                    print(f"    [x] Błąd połączenia: {e}")
+                    s.close()
+                    last_error = e
+        raise ConnectionError(f"Nie udało się połączyć z żadnym seedem: {last_error}")
+
+    def send_ping(self):
+        """
+        Wysyła wiadomość 'ping' do peera wraz z losowym 8-bajtowym nonce i oczekuje na odpowiedź 'pong',
+        aby sprawdzić aktywność i opóźnienie połączenia.
+        """
+        self._ensure_connected()
+        self._send_msg("ping", build_ping_payload())
+        print("[+] Czekam na 'pong'...")
+        try:
+            self._poll_until({"pong"}, timeout=30.0)
+            print("[+] Otrzymano 'pong'.")
+        except TimeoutError as e:
+            print(f"[-] Timeout: {e}")
 
     def _poll_until(self, want_cmds, timeout: float):
         """
@@ -264,10 +376,26 @@ def build_getaddr_payload() -> bytes:
 
 HELP_TEXT = """
 Dostępne komendy:
-
-  help
+    help
+    - pokaż tę pomoc
+ 
+  connectseed
+    - połącz się z losowym peerem z listy DNS seedów (8333)
+ 
   connect <ip> [port]
+    - połącz się z konkretnym peerem, np. connect 1.2.3.4 8333
+ 
+  getaddr
+    - wyślij getaddr i wypisz listę peerów z odpowiedzi addr
+ 
+  peers
+    - wypisz peery z ostatniej wiadomości 'addr'
+ 
+  ping
+    - wyślij ping i poczekaj na pong
+ 
   quit / exit
+    - zakończ program
 """
 
 
@@ -288,6 +416,14 @@ def main():
 
         if cmd in ("quit", "exit"):
             break
+        elif cmd == "connectseed":
+            peer.connect_via_seeds()
+        elif cmd == "getaddr":
+            peer.send_getaddr()
+        elif cmd == "peers":
+            peer.list_last_addr_peers()
+        elif cmd == "ping":
+            peer.send_ping()
         elif cmd == "help":
             print(HELP_TEXT)
         elif cmd == "connect":
