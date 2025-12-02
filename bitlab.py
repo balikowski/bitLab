@@ -5,13 +5,13 @@ import random
 import hashlib
 import select
 
-# Magic bytes sieci głównej Bitcoina – początek każdej wiadomości P2P
+# Magic bytes sieci głównej Bitcoina (początek każdej wiadomości P2P)
 MAINNET_MAGIC = b"\xf9\xbe\xb4\xd9"
 
-# Wersja protokołu P2P, której używa nasz klient
+# Wersja protokołu P2P używana przez klienta
 PROTOCOL_VERSION = 70015
 
-# Lista publicznych "DNS seedów" – domen, z których można pobrać adresy peerów
+# Publiczne DNS seedy – do późniejszego bootstrapa peerów
 DNS_SEEDS = [
     "seed.bitcoin.sipa.be",
     "dnsseed.bluematt.me",
@@ -21,95 +21,228 @@ DNS_SEEDS = [
     "seed.btc.petertodd.org",
 ]
 
+
+def build_version_payload(peer_ip: str, peer_port: int) -> bytes:
+    """Buduje payload wiadomości 'version' dla podanego IP i portu peera."""
+    version = struct.pack("<i", PROTOCOL_VERSION)
+    services = struct.pack("<Q", 0)
+    timestamp = struct.pack("<q", int(time.time()))
+    addr_recv_services = struct.pack("<Q", 0)
+    addr_recv_ip = ipv6_from_ipv4(peer_ip)
+    addr_recv_port = struct.pack(">H", peer_port)
+    addr_trans_services = struct.pack("<Q", 0)
+    addr_trans_ip = ipv6_from_ipv4("127.0.0.1")
+    addr_trans_port = struct.pack(">H", peer_port)
+    nonce = struct.pack("<Q", random.getrandbits(64))
+    ua = "/BitLabPy-Lite:0.1/".encode("ascii")
+    ua_len = compact_size_encode(len(ua))
+    start_height = struct.pack("<i", 0)
+    relay = b"\x00"
+    return b"".join([
+        version, services, timestamp,
+        addr_recv_services, addr_recv_ip, addr_recv_port,
+        addr_trans_services, addr_trans_ip, addr_trans_port,
+        nonce, ua_len, ua, start_height, relay
+    ])
+
+
 class BitcoinPeer:
-    """
-    Prosta klasa reprezentująca połączenie z jednym peerem Bitcoina.
-    Obecnie zawiera tylko informacje o gnieździe i adresie oraz metodę connect().
-    """
+    """Reprezentuje połączenie z jednym peerem Bitcoina."""
+
     def __init__(self):
+        self.sock = None              # gniazdo TCP do peera
+        self.reader = None            # NonBlockingReader dla tego gniazda
+        self.ip = None                # IP peera
+        self.port = None              # port peera
+        self.last_addr_peers = []     # rezerwka na listę peerów z 'addr'
+
+    def _ensure_connected(self):
+        """Sprawdza, czy istnieje aktywne połączenie z peerem."""
+        if not self.sock:
+            raise RuntimeError("Brak połączenia z peerem.")
+
+    def _send_msg(self, command: str, payload: bytes):
+        """Buduje i wysyła pojedynczą wiadomość P2P."""
+        self._ensure_connected()
+        msg = build_message(command, payload)
+        self.sock.sendall(msg)
+        print(f"[<] Wysłano '{command}' ({len(payload)} B).")
+
+    def _poll_until(self, want_cmds, timeout: float):
+        """
+        Czeka na jedną z komend z want_cmds.
+        Po drodze odpowiada na 'ping' wiadomością 'pong'.
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            msgs = self.reader.poll_messages(end - time.time())
+            for cmd, pl in msgs:
+                print(f"[>] Otrzymano: {cmd}")
+                if cmd == "ping":
+                    self._send_msg("pong", pl)
+                elif cmd in want_cmds:
+                    return cmd, pl
+        raise TimeoutError(f"Nie otrzymano {want_cmds} w czasie {timeout}s")
+
+    def close(self):
+        """Zamyka gniazdo i czyści stan połączenia."""
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
         self.sock = None
+        self.reader = None
         self.ip = None
         self.port = None
 
-    def connect(self, ip: str, port: int = 8333):
+    def connect(self, ip: str, port: int = 8333, timeout: float = 10.0):
+        """Łączy z podanym peerem i wykonuje handshake."""
+        self.close()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((ip, port))
+        s.setblocking(False)
+        self.sock = s
+        self.reader = NonBlockingReader(s)
+        self.ip = ip
+        self.port = port
+        print(f"[+] Połączono z {ip}:{port}")
+        self.handshake()
+
+    def handshake(self):
+        """Wysyła 'version' i kończy handshake po 'version'/'verack' od peera."""
+        self._ensure_connected()
+        print("[+] Wysyłam 'version'...")
+        self._send_msg("version", build_version_payload(self.ip, self.port))
+
+        got_version = False
+        got_verack = False
+        end = time.time() + 20.0
+
+        while time.time() < end and not (got_version and got_verack):
+            msgs = self.reader.poll_messages(end - time.time())
+            for cmd, pl in msgs:
+                print(f"[>] Otrzymano: {cmd}")
+                if cmd == "version":
+                    got_version = True
+                    self._send_msg("verack", b"")
+                elif cmd == "verack":
+                    got_verack = True
+                elif cmd == "ping":
+                    self._send_msg("pong", pl)
+
+        if not (got_version and got_verack):
+            raise TimeoutError("Handshake nie został zakończony.")
+        print("[+] Handshake zakończony.")
+
+
+class NonBlockingReader:
+    """Buforuje dane z gniazda i wycina kompletne wiadomości P2P."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.buf = bytearray()
+
+    def poll_messages(self, timeout: float):
         """
-        Na razie tylko wypisuje, że „połączy się” z danym adresem.
-        Docelowo w tej metodzie:
-          - stworzymy gniazdo TCP,
-          - połączymy się z (ip, port),
-          - ustawimy gniazdo jako nieblokujące,
-          - rozpoczniemy handshake (version/verack).
+        Czyta dane z gniazda (select + recv) i zwraca listę (command, payload)
+        dla wszystkich kompletnych wiadomości w buforze.
         """
-        print(f"[+] Połączę się z {ip}:{port}")
+        msgs = []
+        r, _, _ = select.select([self.sock], [], [], timeout)
+        if self.sock in r:
+            data = self.sock.recv(4096)
+            if not data:
+                raise ConnectionError("Połączenie zamknięte przez peer")
+            self.buf.extend(data)
+
+        while True:
+            if len(self.buf) < 24:
+                break
+            magic, cmd_raw, length, csum = struct.unpack("<4s12sI4s", self.buf[:24])
+            if magic != MAINNET_MAGIC:
+                raise ValueError("Złe magic bytes")
+
+            total_len = 24 + length
+            if len(self.buf) < total_len:
+                break
+
+            payload = bytes(self.buf[24:total_len])
+            del self.buf[:total_len]
+
+            cmd = cmd_raw.rstrip(b"\x00").decode("ascii", errors="ignore")
+            if checksum(payload) != csum:
+                print(f"[!] Niepoprawny checksum dla {cmd}")
+
+            msgs.append((cmd, payload))
+
+        return msgs
+
 
 def sha256d(data: bytes) -> bytes:
-    """
-    Liczy tzw. double SHA-256:
-      sha256d(x) = SHA256(SHA256(x))
-    To właśnie taki podwójny hash jest używany w Bitcoinie do:
-      - liczenia hashy bloków,
-      - checksumów wiadomości P2P.
-    """
+    """Double SHA-256: SHA256(SHA256(data))."""
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
+
 def checksum(payload: bytes) -> bytes:
-    """
-    Zwraca 4-bajtowy checksum dla danego payloadu.
-    W nagłówku wiadomości P2P przechowywane są pierwsze 4 bajty z sha256d(payload).
-    Wykorzystujemy to do wykrywania uszkodzonych wiadomości.
-    """
+    """4-bajtowy checksum: pierwsze 4 bajty z sha256d(payload)."""
     return sha256d(payload)[:4]
+
 
 def compact_size_encode(n: int) -> bytes:
     """
-    (DO ZAAIMPLEMENTOWANIA)
-    Zakoduje liczbę n w formacie 'compactSize' (varint) używanym w protokole Bitcoina.
-    Zasada:
-      - jeśli n < 0xfd  ->  1 bajt
-      - jeśli <= 0xffff -> 0xfd + 2 bajty
-      - jeśli <= 0xffffffff -> 0xfe + 4 bajty
-      - inaczej -> 0xff + 8 bajtów
-    Używane m.in. w wiadomościach inv, addr, getheaders itp.
+    Koduje liczbę w formacie compactSize (varint) używanym w Bitcoinie.
     """
-    pass
+    if n < 0xfd:
+        return struct.pack("<B", n)
+    elif n <= 0xFFFF:
+        return b"\xfd" + struct.pack("<H", n)
+    elif n <= 0xFFFFFFFF:
+        return b"\xfe" + struct.pack("<I", n)
+    else:
+        return b"\xff" + struct.pack("<Q", n)
+
 
 def compact_size_decode(buf: bytes, offset: int = 0):
     """
-    (DO ZAAIMPLEMENTOWANIA)
-    Odczyta liczbę w formacie 'compactSize' z bufora zaczynając od 'offset'.
-    Zwróci:
-      (wartość_liczby, nowy_offset_po_odczycie)
-    Używane przy parsowaniu wiadomości (np. liczba adresów w 'addr').
+    Dekoduje compactSize z bufora, zwraca (wartość, nowy_offset).
     """
-    pass
+    if offset >= len(buf):
+        raise IndexError("compact_size_decode: offset poza buforem")
+
+    first = buf[offset]
+    if first < 0xfd:
+        return first, offset + 1
+    elif first == 0xfd:
+        if offset + 3 > len(buf):
+            raise IndexError("compact_size_decode: za mało danych dla 0xfd")
+        return struct.unpack("<H", buf[offset + 1:offset + 3])[0], offset + 3
+    elif first == 0xfe:
+        if offset + 5 > len(buf):
+            raise IndexError("compact_size_decode: za mało danych dla 0xfe")
+        return struct.unpack("<I", buf[offset + 1:offset + 5])[0], offset + 5
+    else:
+        if offset + 9 > len(buf):
+            raise IndexError("compact_size_decode: za mało danych dla 0xff")
+        return struct.unpack("<Q", buf[offset + 1:offset + 9])[0], offset + 9
+
 
 def ipv6_from_ipv4(ipv4_str: str) -> bytes:
-    """
-    (DO ZAAIMPLEMENTOWANIA)
-    Zamienia adres IPv4 (np. '1.2.3.4') na 16-bajtową formę IPv6 typu IPv4-mapped:
-      ::ffff:1.2.3.4
-    W protokole Bitcoin pola adresowe mają zawsze 16 bajtów (IPv6),
-    więc IPv4 opakowujemy w taki sposób.
-    """
-    pass
+    """Zamienia IPv4 (np. '1.2.3.4') na 16-bajtową formę IPv4-mapped IPv6."""
+    parts = bytes(int(x) for x in ipv4_str.split("."))
+    return b"\x00" * 10 + b"\xff\xff" + parts
+
 
 def var_str(b: bytes) -> bytes:
-    """
-    Koduje 'zmienną długość stringa':
-      var_str = compact_size_encode(len(b)) + b
-    Używane np. do user-agenta, tekstów w alert/reject itp.
-    """
+    """Zwraca compactSize(len(b)) + dane; format zmiennego stringa w protokole."""
     return compact_size_encode(len(b)) + b
+
 
 def build_message(command: str, payload: bytes) -> bytes:
     """
-    Buduje pełną wiadomość P2P Bitcoina:
-      - magic      (4B)  -> MAINNET_MAGIC
-      - command    (12B) -> nazwa komendy, np. 'version', 'ping', 'getaddr'
-      - length     (4B)  -> długość payloadu (little-endian)
-      - checksum   (4B)  -> pierwsze 4 bajty z sha256d(payload)
-      - payload    (N B) -> właściwa zawartość wiadomości
-    Funkcja zwraca gotowe bajty do wysłania przez socket.
+    Składa pełną wiadomość P2P:
+    magic (4B) + command (12B) + length (4B) + checksum (4B) + payload.
     """
     cmd = command.encode("ascii")
     cmd_padded = cmd + b"\x00" * (12 - len(cmd))
@@ -117,22 +250,15 @@ def build_message(command: str, payload: bytes) -> bytes:
     csum = checksum(payload)
     return MAINNET_MAGIC + cmd_padded + length + csum + payload
 
+
 def build_ping_payload() -> bytes:
-    """
-    Buduje payload dla wiadomości 'ping':
-      - 8-bajtowy losowy nonce (little-endian)
-    Peer, który otrzyma 'ping', powinien odesłać 'pong' z tym samym nonce.
-    Służy to do sprawdzania, czy połączenie nadal żyje.
-    """
+    """Payload 'ping' – 8-bajtowy losowy nonce."""
     nonce = random.getrandbits(64)
     return struct.pack("<Q", nonce)
 
+
 def build_getaddr_payload() -> bytes:
-    """
-    Zwraca payload dla wiadomości 'getaddr'.
-    Dla getaddr payload jest pusty – sama komenda sygnalizuje:
-      „podaj mi listę znanych peerów (addr)”.
-    """
+    """Payload 'getaddr' – pusty (sama komenda wystarcza)."""
     return b""
 
 
@@ -144,14 +270,12 @@ Dostępne komendy:
   quit / exit
 """
 
+
 def main():
     """
-    Główna funkcja programu:
-      - tworzy obiekt BitcoinPeer,
-      - uruchamia prostą pętlę REPL (czyta komendy z klawiatury),
-      - obsługuje podstawowe polecenia:
+    Tworzy obiekt BitcoinPeer i obsługuje proste CLI:
+    help / connect / quit.
     """
-     
     peer = BitcoinPeer()
     print("=== BitLab – start ===")
     print("Wpisz 'help', żeby zobaczyć komendy.")
@@ -175,6 +299,7 @@ def main():
             peer.connect(ip, port)
         else:
             print("[-] Nieznana komenda.")
+
 
 if __name__ == "__main__":
     main()
